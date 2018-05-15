@@ -48,8 +48,10 @@ class LedNode(IotNode):
             commandTypeComponent = interest.getName().get(self.prefix.size()+1)
             commandType = commandTypeComponent.toEscapedString()
             if commandType == 'on':
+                print("elo")
                 GPIO.output(self.pinNumber, GPIO.HIGH)
             elif commandType == 'off':
+                print("melo")
                 GPIO.output(self.pinNumber, GPIO.LOW)
             else:
                 raise RuntimeError('BadCommand')
