@@ -24,9 +24,13 @@ from pyndn.security.policy import ConfigPolicyManager
 from pyndn import Name
 
 from pyndn.security.security_exception import SecurityException
-from pyndn.util.boost_info_parser import BoostInfoParser
+from pyndn.util.boost_info_parser import BoostInfoParser, BoostInfoTree
+
+from pyndn.security.policy.certificate_cache import CertificateCache
+from pyndn.util import Blob
 
 import os
+from base64 import b64encode
 
 """
 This module implements a simple hierarchical trust model that uses certificate
@@ -58,8 +62,11 @@ class IotPolicyManager(ConfigPolicyManager):
 
         if configFilename is None:
             configFilename = templateFilename
+        
+        certificateCache = CertificateCache()
+        super(IotPolicyManager, self).__init__(configFilename, certificateCache)
+        self._identityStorage = identityStorage
 
-        super(IotPolicyManager, self).__init__(identityStorage, configFilename)
         self.setEnvironmentPrefix(None)
         self.setTrustRootIdentity(None)
         self.setDeviceIdentity(None)
@@ -72,11 +79,11 @@ class IotPolicyManager(ConfigPolicyManager):
         Not called automatically in case they are all changing (typical for
         bootstrapping).
 
-        Resets the validation rules if we don't have a trust root or enivronment
+        Resets the validation rules if we don't have a trust root or environment
 
         """
         validatorTree = self._configTemplate["validator"][0].clone()
-
+        
         if (self._environmentPrefix.size() > 0 and 
             self._trustRootIdentity.size() > 0 and 
             self._deviceIdentity.size() > 0):
@@ -86,7 +93,7 @@ class IotPolicyManager(ConfigPolicyManager):
             
             environmentUri = self._environmentPrefix.toUri()
             deviceUri = self._deviceIdentity.toUri()
-             
+            
             for rule in validatorTree["rule"]:
                 ruleId = rule["id"][0].value
                 if ruleId == 'Certificate Trust':
@@ -95,11 +102,25 @@ class IotPolicyManager(ConfigPolicyManager):
                 elif ruleId == 'Command Interests':
                     rule["filter/name"][0].value = deviceUri
                     rule["checker/key-locator/name"][0].value = environmentUri
-            
+        
+        #debug for adding trust anchor
+        # try:
+        #     validatorTree["trust-anchor"][0]["type"][0].value = "base64"
+        #     rootCertificate = self._identityStorage.getCertificate(self._identityStorage.getDefaultCertificateNameForIdentity(self._trustRootIdentity))
+        #     validatorTree["trust-anchor"][0]["base64-string"][0].value = Blob(b64encode(rootCertificate.wireEncode().toBytes()), False).toRawStr()
+        # except KeyError as e:
+        #     rootCertificate = self._identityStorage.getCertificate(self._identityStorage.getDefaultCertificateNameForIdentity(self._trustRootIdentity))
+        #     treeNode = self.config._root.subtrees["validator"][0].createSubtree("trust-anchor")
+        #     # todo: change this!
+        #     treeNode.createSubtree("type", "file")
+        #     print Blob(b64encode(rootCertificate.wireEncode().toBytes()), False).toRawStr()
+        #     treeNode.createSubtree("file-name", "/home/zhehao/.ndn/.iot.root.cert")
+        # self._loadTrustAnchorCertificates()
+
         #remove old validation rules from config
         # replace with new validator rules
         self.config._root.subtrees["validator"] = [validatorTree]
-        
+
 
     def inferSigningIdentity(self, fromName):
         """
@@ -114,6 +135,7 @@ class IotPolicyManager(ConfigPolicyManager):
         : param pyndn.Name identityName: The new identity to trust as the controller.
         """
         self._trustRootIdentity = Name(identityName)
+
 
     def getTrustRootIdentity(self):
         """

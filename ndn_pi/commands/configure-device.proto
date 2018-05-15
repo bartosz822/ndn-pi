@@ -1,11 +1,1 @@
-message DeviceConfigurationMessage {
-	message Name {
-		repeated bytes components = 8;
-	}
-    message DeviceConfiguration {
-        required Name networkPrefix = 224;
-        required Name controllerName = 225;
-        required Name deviceSuffix = 226;
-    }
-	required DeviceConfiguration configuration = 227;
-}
+../../commands/configure-device.proto

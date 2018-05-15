@@ -1,11 +1,1 @@
-message CertificateRequestMessage {
-	message Name {
-		repeated bytes components = 8;
-	}
-	message CertificateRequest {
-		required Name keyName = 220;
-        required uint32 keyType = 221;
-        required bytes keyBits = 222;
-	}
-	required CertificateRequest command = 223;
-}
+../../commands/cert-request.proto

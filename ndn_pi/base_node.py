@@ -1,8 +1,8 @@
 
 # -*- Mode:python; c-file-style:"gnu"; indent-tabs-mode:nil -*- */
 #
-# Copyright (C) 2014 Regents of the University of California.
-# Author: Adeola Bannis <thecodemaiden@gmail.com>
+# Copyright (C) 2016 Regents of the University of California.
+# Author: Adeola Bannis <thecodemaiden@gmail.com> Zhehao Wang <zhehao@cs.ucla.edu>
 # 
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Lesser General Public License as published by
@@ -17,41 +17,46 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 # A copy of the GNU General Public License is in the file COPYING.
+
 import logging
 import time
 import sys
-import random
 
-from pyndn import Name, Face, Interest, Data, ThreadsafeFace
+from pyndn import Name, Face, Interest, Data
 from pyndn.security import KeyChain
+
 from pyndn.security.policy import ConfigPolicyManager
-from pyndn.security.identity import IdentityManager
+from pyndn.security.identity import IdentityManager, BasicIdentityStorage, FilePrivateKeyStorage
 from pyndn.security.security_exception import SecurityException
 
-from ndn_pi.security import IotIdentityStorage,IotPolicyManager, IotIdentityManager
-
 from collections import namedtuple
+
+from security.iot_policy_manager import IotPolicyManager
 
 try:
     import asyncio
 except ImportError:
     import trollius as asyncio
 
+from pyndn.threadsafe_face import ThreadsafeFace
+
 Command = namedtuple('Command', ['suffix', 'function', 'keywords', 'isSigned'])
 
 class BaseNode(object):
     """
     This class contains methods/attributes common to both node and controller.
-    
     """
-    def __init__(self):
+    def __init__(self, transport = None, conn = None):
         """
         Initialize the network and security classes for the node
         """
         super(BaseNode, self).__init__()
+        self.faceTransport = transport
+        self.faceConn = conn
+        
+        self._identityStorage = BasicIdentityStorage()
 
-        self._identityStorage = IotIdentityStorage()
-        self._identityManager = IotIdentityManager(self._identityStorage)
+        self._identityManager = IdentityManager(self._identityStorage, FilePrivateKeyStorage())
         self._policyManager = IotPolicyManager(self._identityStorage)
 
         # hopefully there is some private/public key pair available
@@ -61,25 +66,7 @@ class BaseNode(object):
         self._prepareLogging()
 
         self._setupComplete = False
-        self._instanceSerial = None
 
-        # waiting devices register this prefix and respond to discovery
-        # or configuration interest
-        self._hubPrefix = Name('/localhop/configure')
-
-    def getSerial(self):
-        """
-         Since you may wish to run two nodes on a Raspberry Pi, each
-         node will generate a unique serial number each time it starts up.
-        """
-        if self._instanceSerial is None:
-            prefixLen = 4
-            prefix = ''
-            for i in range(prefixLen):
-                prefix += (chr(random.randint(0,0xff)))
-            suffix = self.getDeviceSerial().lstrip('0')
-            self._instanceSerial = '-'.join([prefix.encode('hex'), suffix])
-        return self._instanceSerial
 
 ##
 # Logging
@@ -122,9 +109,11 @@ class BaseNode(object):
         try:
             certName = self._identityStorage.getDefaultCertificateNameForIdentity( 
                 self._policyManager.getDeviceIdentity())
-        except SecurityException:
-            certName = self._keyChain.getDefaultCertificateName()
-
+        except SecurityException as e:
+            # zhehao: in the case of producer's /localhop prefixes, the default key is not defined in ndnsec-public-info.db
+            certName = self._keyChain.createIdentityAndCertificate(self._policyManager.getDeviceIdentity())
+            #certName = self._keyChain.getDefaultCertificateName()
+            #print(certName.toUri())
         return certName
 
     def start(self):
@@ -134,22 +123,25 @@ class BaseNode(object):
         """
         self.log.info("Starting up")
         self.loop = asyncio.get_event_loop()
-        self.face = ThreadsafeFace(self.loop, '')
+        
+        if (self.faceTransport == None or self.faceTransport == ''):
+            self.face = ThreadsafeFace(self.loop)
+        else:
+            self.face = ThreadsafeFace(self.loop, self.faceTransport, self.faceConn)
+        
         self.face.setCommandSigningInfo(self._keyChain, self.getDefaultCertificateName())
+        
         self._keyChain.setFace(self.face)
 
         self._isStopped = False
-        self.face.stopWhen(lambda:self._isStopped)
         self.beforeLoopStart()
         
         try:
             self.loop.run_forever()
-        except KeyboardInterrupt:
-            pass
         except Exception as e:
-            self.log.exception(e, exc_info=True)
+            self.log.exception(exc_info=True)
         finally:
-            self._isStopped = True
+            self.stop()
 
     def stop(self):
         """
@@ -157,6 +149,7 @@ class BaseNode(object):
         """
         self.log.info("Shutting down")
         self._isStopped = True 
+        self.loop.stop()
         
 ###
 # Data handling
@@ -168,17 +161,15 @@ class BaseNode(object):
         """
         self._keyChain.sign(data, self.getDefaultCertificateName())
 
-    def sendData(self, data, transport, sign=True):
+    def sendData(self, data, sign=True):
         """
         Reply to an interest with a data packet, optionally signing it.
         :param pyndn.Data data: The response data packet
-        :param pyndn.Transport transport: The transport to send the data through. This is 
-            obtained from an incoming interest handler
         :param boolean sign: (optional, default=True) Whether the response must be signed. 
         """
         if sign:
             self.signData(data)
-        transport.send(data.wireEncode().buf())
+        self.face.putData(data)
 
 ###
 # 
@@ -189,13 +180,15 @@ class BaseNode(object):
         Called when the node cannot register its name with the forwarder
         :param pyndn.Name prefix: The network name that failed registration
         """
-        if self._registrationFailures < 5:
+        if self.faceTransport != None and self.faceConn != None:
+            self.log.warn("Explicit face transport and connectionInfo: Could not register {}; expect a manual or autoreg on the other side.".format(prefix.toUri()))
+        elif self._registrationFailures < 5:
             self._registrationFailures += 1
             self.log.warn("Could not register {}, retry: {}/{}".format(prefix.toUri(), self._registrationFailures, 5)) 
             self.face.registerPrefix(self.prefix, self._onCommandReceived, self.onRegisterFailed)
         else:
-            self.log.critical("Could not register device prefix, ABORTING")
-            self._isStopped = True
+            self.log.info("Prefix registration failed")
+            self.stop()
 
     def verificationFailed(self, dataOrInterest):
         """
@@ -205,15 +198,17 @@ class BaseNode(object):
         self.log.info("Received invalid" + dataOrInterest.getName().toUri())
 
     @staticmethod
-    def getDeviceSerial():
+    def getSerial():
         """
         Find and return the serial number of the Raspberry Pi. Provided in case
         you wish to distinguish data from nodes with the same name by serial.
         :return: The serial number extracted from device information in /proc/cpuinfo
         :rtype: str
         """
-        with open('/proc/cpuinfo') as f:
-            for line in f:
-                if line.startswith('Serial'):
-                    return line.split(':')[1].strip()
-
+        try:
+            with open('/proc/cpuinfo') as f:
+                for line in f:
+                    if line.startswith('Serial'):
+                        return line.split(':')[1].strip()
+        except NameError:
+            return "todo"

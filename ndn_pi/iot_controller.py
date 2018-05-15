@@ -1,50 +1,33 @@
-# -*- Mode:python; c-file-style:"gnu"; indent-tabs-mode:nil -*- */
-#
-# Copyright (C) 2014 Regents of the University of California.
-# Author: Adeola Bannis <thecodemaiden@gmail.com>
-# 
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Lesser General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <http://www.gnu.org/licenses/>.
-# A copy of the GNU General Public License is in the file COPYING.
-
-
 from __future__ import print_function
 
 import logging
 import time
+from sys import stdin, stdout
+import struct
 
-from pyndn import Name, Face, Interest, Data, ThreadsafeFace
-from pyndn.util import Blob
+from pyndn import Name, Face, Interest, Data
 from pyndn.security import KeyChain
 from pyndn.security.certificate import IdentityCertificate, PublicKey, CertificateSubjectDescription
 from pyndn.encoding import ProtobufTlv
 from pyndn.security.security_exception import SecurityException
+from pyndn.util import Blob, MemoryContentCache
+from pyndn.util.boost_info_parser import BoostInfoParser, BoostInfoTree
 
-from base_node import BaseNode
+from base_node import BaseNode, Command
 
-from commands import CertificateRequestMessage, UpdateCapabilitiesCommandMessage, DeviceConfigurationMessage, DevicePairingInfoMessage
-from security import HmacHelper
+from commands import CertificateRequestMessage, UpdateCapabilitiesCommandMessage, DeviceConfigurationMessage, AppRequestMessage
+from security.hmac_helper import HmacHelper
 
-from collections import defaultdict, OrderedDict
+from collections import defaultdict
 import json
-import base64
+from base64 import b64encode
 
-from dialog import Dialog
-import logging 
 try:
     import asyncio
 except ImportError:
     import trollius as asyncio
+
+from pyndn.threadsafe_face import ThreadsafeFace
 
 # more Python 2+3 compatibility
 try:
@@ -55,17 +38,15 @@ except NameError:
 class IotController(BaseNode):
     """
     The controller class has a few built-in commands:
-        - listCommands: return the names and capabilities of all attached 
-            devices
+        - listDevices: return the names and capabilities of all attached devices
         - certificateRequest: takes public key information and returns name of
             new certificate
-        - updateCapabilities: should be sent periodically from IotNodes to 
-            update their command lists
-        - addDevice: called by the console to begin pairing, the payload is 
-            encrypted for the controller as it contains a PIN
+        - updateCapabilities: should be sent periodically from IotNodes to update their
+           command lists
+        - addDevice: add a device based on HMAC
     It is unlikely that you will need to subclass this.
     """
-    def __init__(self, nodeName, networkName):
+    def __init__(self, nodeName, networkName, applicationDirectory = ""):
         super(IotController, self).__init__()
         
         self.deviceSuffix = Name(nodeName)
@@ -88,14 +69,17 @@ class IotController(BaseNode):
         self._baseDirectory = {}
 
         # add the built-ins
-        self._insertIntoCapabilities('listCommands', 'directory', False)
-
-        # TODO: use xDialog in XWindows
-        self.ui = Dialog(backtitle='NDN IoT User Console', height=18, width=78)
+        self._insertIntoCapabilities('listDevices', 'directory', False)
+        self._insertIntoCapabilities('updateCapabilities', 'capabilities', True)
 
         self._directory.update(self._baseDirectory)
-        self.setLogLevel(logging.INFO)
 
+        # Set up application directory
+        if applicationDirectory == "":
+            applicationDirectory = os.path.expanduser('~/.ndn/iot/applications')
+        self._applicationDirectory = applicationDirectory
+        self._applications = dict()
+        
     def _insertIntoCapabilities(self, commandName, keyword, isSigned):
         newUri = Name(self.prefix).append(Name(commandName)).toUri()
         self._baseDirectory[keyword] = [{'signed':isSigned, 'name':newUri}]
@@ -103,57 +87,46 @@ class IotController(BaseNode):
     def beforeLoopStart(self):
         if not self._policyManager.hasRootSignedCertificate():
             # make one....
-            self.log.warn('Generating controller key pair (this could take a while)...')
+            self.log.warn('Generating controller certificate...')
             newKey = self._identityManager.generateRSAKeyPairAsDefault(
-                self.prefix, isKsk=True, progressFunc=self._showRSAProgress)
+                self.prefix, isKsk=True)
             newCert = self._identityManager.selfSign(newKey)
             self._identityManager.addCertificateAsDefault(newCert)
+        # Trusting root's own certificate upon each run
+        # TODO: debug where application starts first and controller starts second, application's interest cannot be verified
+        self._rootCertificate = self._keyChain.getCertificate(self.getDefaultCertificateName())
+        self._policyManager._certificateCache.insertCertificate(self._rootCertificate)
+        
+        self._memoryContentCache = MemoryContentCache(self.face)
         self.face.setCommandSigningInfo(self._keyChain, self.getDefaultCertificateName())
-        self.face.registerPrefix(self.prefix, 
-            self._onCommandReceived, self.onRegisterFailed)
+        self._memoryContentCache.registerPrefix(self.prefix, onRegisterFailed = self.onRegisterFailed, 
+          onRegisterSuccess = None, onDataNotFound = self._onCommandReceived)
+        # Serve root certificate in our memoryContentCache
+        self._memoryContentCache.add(self._rootCertificate)
+        self.loadApplications()
         self.loop.call_soon(self.onStartup)
 
-
 ######
-# Initial device configuration
+# Initial configuration
 #######
-
-    def _beginPairing(self, encryptedMessage):
-        # base64 decode, decrypt, protobuf decode
-        responseCode = 202
-        try:
-            encryptedBytes = base64.urlsafe_b64decode(str(encryptedMessage.getValue()))
-            decryptedBytes = self._identityManager.decryptAsIdentity(encryptedBytes, self.prefix)
-            message = DevicePairingInfoMessage()
-            ProtobufTlv.decode(message, decryptedBytes)
-        except:
-            responseCode = 500
-        else:
-            info = message.info
-            self.loop.call_soon(self._addDeviceToNetwork, info.deviceSerial, 
-                info.deviceSuffix, info.devicePin)
-        return responseCode
-
+    # TODO: deviceSuffix will be replaced by deviceSerial
     def _addDeviceToNetwork(self, deviceSerial, newDeviceSuffix, pin):
         h = HmacHelper(pin)
         self._hmacDevices[deviceSerial] = h
 
         d = DeviceConfigurationMessage()
 
-        newDeviceSuffix = Name(newDeviceSuffix)
-
         for source, dest in [(self.networkPrefix, d.configuration.networkPrefix),
                              (self.deviceSuffix, d.configuration.controllerName),
                              (newDeviceSuffix, d.configuration.deviceSuffix)]:
-            for i in range(len(source)):
+            for i in range(source.size()):
                 component = source.get(i)
                 dest.components.append(component.getValue().toRawStr())
 
-        interestName = Name('/localhop/configure').append(Name(deviceSerial))
+        interestName = Name('/home/configure').append(Name(deviceSerial))
         encodedParams = ProtobufTlv.encode(d)
         interestName.append(encodedParams)
         interest = Interest(interestName)
-        interest.setInterestLifetimeMilliseconds(5000)
         h.signInterest(interest)
 
         self.face.expressInterest(interest, self._deviceAdditionResponse,
@@ -178,7 +151,7 @@ class IotController(BaseNode):
 # Certificate signing
 ######
 
-    def _handleCertificateRequest(self, interest, transport):
+    def _handleCertificateRequest(self, interest):
         """
         Extracts a public key name and key bits from a command interest name 
         component. Generates a certificate if the request is verifiable.
@@ -203,8 +176,8 @@ class IotController(BaseNode):
                 self._hmacDevices.pop(deviceSerial)
         except KeyError:
             self.log.warn('Received certificate request for device with no registered key')
-        except SecurityException:
-            self.log.warn('Could not create device certificate')
+        except SecurityException as e:
+            self.log.warn('Could not create device certificate: ' + str(e))
         else:
             self.log.info('Creating certificate for device {}'.format(deviceSerial))
 
@@ -215,7 +188,7 @@ class IotController(BaseNode):
             response.setContent("Denied")
         if hmac is not None:
             hmac.signData(response)
-        self.sendData(response, transport, False)
+        self.sendData(response, False)
 
     def _createCertificateFromRequest(self, message):
         """
@@ -238,15 +211,18 @@ class IotController(BaseNode):
 
         try:
             self._identityStorage.addKey(keyName, keyType, keyDer)
-        except SecurityException:
+        except SecurityException as e:
+            print(e)
             # assume this is due to already existing?
             pass
 
-        certificate = self._identityManager.generateCertificateForKey(keyName)
+        certificate = self._identityManager._generateCertificateForKey(keyName)
 
         self._keyChain.sign(certificate, self.getDefaultCertificateName())
         # store it for later use + verification
         self._identityStorage.addCertificate(certificate)
+        self._policyManager._certificateCache.insertCertificate(certificate)
+
         return certificate
 
 ######
@@ -290,7 +266,7 @@ class IotController(BaseNode):
                         listing = {'signed':capability.needsSignature,
                                 'name':commandUri}
                         tempDirectory[keyword].append(listing)
-        self._directory= tempDirectory
+        self._directory = tempDirectory
 
     def _prepareCapabilitiesList(self, interestName):
         """
@@ -308,89 +284,329 @@ class IotController(BaseNode):
 # Interest handling
 ####
 
-    def _onCommandReceived(self, prefix, interest, transport, prefixId):
+    def _onCommandReceived(self, prefix, interest, face, interestFilterId, filter):
         """
         """
         interestName = interest.getName()
 
         #if it is a certificate name, serve the certificate
-        foundCert = self._identityStorage.getCertificate(interestName)
-        if foundCert is not None:
-            self.log.debug("Serving certificate request")
-            transport.send(foundCert.wireEncode().buf())
-            return
+        # TODO: since we've memoryContentCache serving root cert now, this should no longer be required
+        try:
+            if interestName.isPrefixOf(self.getDefaultCertificateName()):
+                foundCert = self._identityManager.getCertificate(self.getDefaultCertificateName())
+                self.log.debug("Serving certificate request")
+                self.face.putData(foundCert)
+                return
+        except SecurityException as e:
+            # We don't have this certificate, this is probably not a certificate request
+            # TODO: this does not differentiate from certificate request but certificate not exist; should update
+            print(str(e))
+            pass
 
         afterPrefix = interestName.get(prefix.size()).toEscapedString()
-        if afterPrefix == "listCommands":
+        if afterPrefix == "listDevices":
             #compose device list
             self.log.debug("Received device list request")
             response = self._prepareCapabilitiesList(interestName)
-            self.sendData(response, transport)
+            self.sendData(response)
         elif afterPrefix == "certificateRequest":
             #build and sign certificate
             self.log.debug("Received certificate request")
-            self._handleCertificateRequest(interest, transport)
+            self._handleCertificateRequest(interest)
+
         elif afterPrefix == "updateCapabilities":
             # needs to be signed!
             self.log.debug("Received capabilities update")
             def onVerifiedCapabilities(interest):
+                print("capabilities good")
                 response = Data(interest.getName())
                 response.setContent(str(time.time()))
-                self.sendData(response, transport)
+                self.sendData(response)
                 self._updateDeviceCapabilities(interest)
             self._keyChain.verifyInterest(interest, 
                     onVerifiedCapabilities, self.verificationFailed)
-        elif afterPrefix == "addDevice":
-            self.log.debug("Received pairing request")
-            def onVerifiedPairingRequest(interest):
+        elif afterPrefix == "requests":
+            # application request to publish under some names received; need to be signed
+            def onVerifiedAppRequest(interest):
+                # TODO: for now, we automatically grant access to any valid signed interest
+                print("verified! send response!")
+                message = AppRequestMessage()
+                ProtobufTlv.decode(message, interest.getName().get(prefix.size() + 1).getValue())
+                certName = Name("/".join(message.command.idName.components))
+                dataPrefix = Name("/".join(message.command.dataPrefix.components))
+                appName = message.command.appName
+                isUpdated = self.updateTrustSchema(appName, certName, dataPrefix, True)
+
                 response = Data(interest.getName())
-                encryptedMessage = interest.getName()[len(prefix)+1]
-                responseCode = self._beginPairing(encryptedMessage)
-                response.setContent(str(responseCode))
-                self.sendData(response, transport)
-            self._keyChain.verifyInterest(interest, onVerifiedPairingRequest, self.verificationFailed)
+                if isUpdated:
+                    response.setContent("{\"status\": 200, \"message\": \"granted, trust schema updated OK\" }")
+                    self.log.info("Verified and granted application publish request")
+                else:
+                    response.setContent("{\"status\": 400, \"message\": \"not granted, requested publishing namespace already exists\" }")
+                    self.log.info("Verified and but requested namespace already exists")
+                self.sendData(response)
+                return
+            def onVerificationFailedAppRequest(interest):
+                print("application request verify failed!")
+                response = Data(interest.getName())
+                response.setContent("{\"status\": 401, \"message\": \"command interest verification failed\" }")
+                self.sendData(response)
+            self.log.info("Received application request: " + interestName.toUri())
+            #print("Verifying with trust schema: ")
+            #print(self._policyManager.config)
+            self._keyChain.verifyInterest(interest, 
+                    onVerifiedAppRequest, onVerificationFailedAppRequest)
         else:
-            response = Data(interest.getName())
-            response.setContent("500")
-            response.getMetaInfo().setFreshnessPeriod(1000)
-            transport.send(response.wireEncode().buf())
+            print("Got interest unable to answer yet: " + interest.getName().toUri())
+            if interest.getExclude():
+                print("interest has exclude: " + interest.getExclude().toUri())
+            # response = Data(interest.getName())
+            # response.setContent("500")
+            # response.getMetaInfo().setFreshnessPeriod(1000)
+            # self.sendData(response)
 
     def onStartup(self):
         # begin taking add requests
-        self.log.info('Controller is ready')
+        self.loop.call_soon(self.displayMenu)
+        self.loop.add_reader(stdin, self.handleUserInput) 
 
-    def _showRSAProgress(self, displayStr=''):
-        displayStr = displayStr.strip()
-        msg = ''
-        if displayStr == 'p,q':
-            msg = 'Generating giant prime numbers...'
-        elif displayStr == 'd':
-            msg = 'Generating private exponent...'
-        elif displayStr == 'u':
-            msg = 'Checking CRT coefficient...'
-        self.log.debug(msg)
+    def displayMenu(self):
+        menuStr = "\n"
+        menuStr += "P)air a new device with serial and PIN\n"
+        menuStr += "D)irectory listing\n"
+        menuStr += "E)xpress an interest\n"
+        menuStr += "L)oad hosted applications (" + (self._applicationDirectory) + ")\n"
+        menuStr += "Q)uit\n"
 
+        print(menuStr)
+        print ("> ", end="")
+        stdout.flush()
+
+    def listDevices(self):
+        menuStr = ''
+        for capability, commands in self._directory.items():
+            menuStr += '{}:\n'.format(capability)
+            for info in commands:
+                signingStr = 'signed' if info['signed'] else 'unsigned'
+                menuStr += '\t{} ({})\n'.format(info['name'], signingStr)
+        print(menuStr)
+        self.loop.call_soon(self.displayMenu)
+
+    def loadApplicationsMenuSelect(self):
+        try:
+            confirm = input('This will override existing trust schemas, continue? (Y/N): ').upper().startswith('Y')
+            if confirm:
+                self.loadApplications(override = True)
+            else:
+                print("Aborted")
+        except KeyboardInterrupt:
+            print("Aborted")
+        finally:
+            self.loop.call_soon(self.displayMenu)
+
+    def onInterestTimeout(self, interest):
+        print('Interest timed out: {}'.interest.getName().toUri())
+
+    def onDataReceived(self, interest, data):
+        print('Received data named: {}'.format(data.getName().toUri()))
+        print('Contents:\n{}'.format(data.getContent().toRawStr()))
+    
+    def expressInterest(self):
+        try:
+            interestName = input('Interest name: ')
+            if len(interestName):
+                toSign = input('Signed? (y/N): ').upper().startswith('Y')
+                interest = Interest(Name(interestName))
+                print(interest)
+                interest.setInterestLifetimeMilliseconds(10000)
+                interest.setChildSelector(1)
+                if (toSign):
+                    self.face.makeCommandInterest(interest) 
+                self.face.expressInterest(interest, self.onDataReceived, self.onInterestTimeout)
+            else:
+                print("Aborted")
+        except KeyboardInterrupt:
+                print("Aborted")
+        finally:
+                self.loop.call_soon(self.displayMenu)
+
+    def beginPairing(self):
+        try:
+            deviceSerial = input('Device serial: ') 
+            devicePin = input('PIN: ')
+            deviceSuffix = input('Node name: ')
+        except KeyboardInterrupt:
+            print('Pairing attempt aborted')
+        else:
+            if len(deviceSerial) and len(devicePin) and len(deviceSuffix):
+                self._addDeviceToNetwork(deviceSerial, Name(deviceSuffix), 
+                    devicePin.decode('hex'))
+            else:
+               print('Pairing attempt aborted')
+        finally:
+            self.loop.call_soon(self.displayMenu)
+
+    def handleUserInput(self):
+        inputStr = stdin.readline().upper()
+        if inputStr.startswith('D'):
+            self.listDevices()
+        elif inputStr.startswith('P'):
+            self.beginPairing()
+        elif inputStr.startswith('E'):
+            self.expressInterest()
+        elif inputStr.startswith('Q'):
+            self.stop()
+        elif inputStr.startswith('L'):
+            self.loadApplicationsMenuSelect()
+        else:
+            self.loop.call_soon(self.displayMenu)
+            
+########################
+# application trust schema distribution
+########################
+    def updateTrustSchema(self, appName, certName, dataPrefix, publishNew = False):
+        if appName in self._applications:
+            if dataPrefix.toUri() in self._applications[appName]["dataPrefix"]:
+                print("some key is configured for namespace " + dataPrefix.toUri() + " for application " + appName + ". Ignoring this request.")
+                return False
+            else:
+                # TODO: Handle malformed conf where validator tree does not exist
+                validatorNode = self._applications[appName]["tree"]["validator"][0]
+        else:
+            # This application does not previously exist, we create its trust schema 
+            # (and for now, add in static rules for sync data)
+
+            self._applications[appName] = {"tree": BoostInfoParser(), "dataPrefix": [], "version": 0}
+            validatorNode = self._applications[appName]["tree"].getRoot().createSubtree("validator")
+            
+            trustAnchorNode = validatorNode.createSubtree("trust-anchor")
+            #trustAnchorNode.createSubtree("type", "file")
+            #trustAnchorNode.createSubtree("file-name", os.path.expanduser("~/.ndn/iot/root.cert"))
+            trustAnchorNode.createSubtree("type", "base64")
+            trustAnchorNode.createSubtree("base64-string", Blob(b64encode(self._rootCertificate.wireEncode().toBytes()), False).toRawStr())
+
+            #create cert verification rule
+            # TODO: the idea for this would be, if the cert has /home-prefix/<one-component>/KEY/ksk-*/ID-CERT, then it should be signed by fixed controller(s)
+            # if the cert has /home-prefix/<multiple-components>/KEY/ksk-*/ID-CERT, then it should be checked hierarchically (this is for subdomain support)
+            certRuleNode = validatorNode.createSubtree("rule")
+            certRuleNode.createSubtree("id", "Certs")
+            certRuleNode.createSubtree("for", "data")
+
+            filterNode = certRuleNode.createSubtree("filter")
+            filterNode.createSubtree("type", "regex")
+            filterNode.createSubtree("regex", "^[^<KEY>]*<KEY><>*<ID-CERT>")
+
+            checkerNode = certRuleNode.createSubtree("checker")
+            # TODO: wait how did my first hierarchical verifier work?
+            #checkerNode.createSubtree("type", "hierarchical")
+
+            checkerNode.createSubtree("type", "customized")
+            checkerNode.createSubtree("sig-type", "rsa-sha256")
+
+            keyLocatorNode = checkerNode.createSubtree("key-locator")
+            keyLocatorNode.createSubtree("type", "name")
+            # We don't put cert version in there
+            keyLocatorNode.createSubtree("name", Name(self.getDefaultCertificateName()).getPrefix(-1).toUri())
+            keyLocatorNode.createSubtree("relation", "equal")
+
+            # Discovery rule: anything that multicasts under my home prefix should be signed, and the signer should have been authorized by root
+            # TODO: This rule as of right now is over-general
+            discoveryRuleNode = validatorNode.createSubtree("rule")
+            discoveryRuleNode.createSubtree("id", "sync-data")
+            discoveryRuleNode.createSubtree("for", "data")
+
+            filterNode = discoveryRuleNode.createSubtree("filter")
+            filterNode.createSubtree("type", "regex")
+            filterNode.createSubtree("regex", "^[^<MULTICAST>]*<MULTICAST><>*")
+
+            checkerNode = discoveryRuleNode.createSubtree("checker")
+            # TODO: wait how did my first hierarchical verifier work?
+            #checkerNode.createSubtree("type", "hierarchical")
+
+            checkerNode.createSubtree("type", "customized")
+            checkerNode.createSubtree("sig-type", "rsa-sha256")
+
+            keyLocatorNode = checkerNode.createSubtree("key-locator")
+            keyLocatorNode.createSubtree("type", "name")
+            keyLocatorNode.createSubtree("regex", "^[^<KEY>]*<KEY><>*<ID-CERT>")
+
+
+        ruleNode = validatorNode.createSubtree("rule")
+        ruleNode.createSubtree("id", dataPrefix.toUri())
+        ruleNode.createSubtree("for", "data")
+        
+        filterNode = ruleNode.createSubtree("filter")
+        filterNode.createSubtree("type", "name")
+        filterNode.createSubtree("name", dataPrefix.toUri())
+        filterNode.createSubtree("relation", "is-prefix-of")
+
+        checkerNode = ruleNode.createSubtree("checker")
+        checkerNode.createSubtree("type", "customized")
+        checkerNode.createSubtree("sig-type", "rsa-sha256")
+
+        keyLocatorNode = checkerNode.createSubtree("key-locator")
+        keyLocatorNode.createSubtree("type", "name")
+        # We don't put cert version in there
+        keyLocatorNode.createSubtree("name", certName.getPrefix(-1).toUri())
+        keyLocatorNode.createSubtree("relation", "equal")
+
+        if not os.path.exists(self._applicationDirectory):
+            os.makedirs(self._applicationDirectory)
+        self._applications[appName]["tree"].write(os.path.join(self._applicationDirectory, appName + ".conf"))
+        self._applications[appName]["dataPrefix"].append(dataPrefix.toUri())
+        self._applications[appName]["version"] = int(time.time())
+        if publishNew:
+            # TODO: ideally, this is the trust schema of the application, and does not necessarily carry controller prefix. 
+            # We make it carry controller prefix here so that prefix registration / route setup is easier (implementation workaround)
+            data = Data(Name(self.prefix).append(appName).append("_schema").appendVersion(self._applications[appName]["version"]))
+            data.setContent(str(self._applications[appName]["tree"].getRoot()))
+            self.signData(data)
+            self._memoryContentCache.add(data)
+        return True
+    
+    # TODO: putting existing confs into memoryContentCache        
+    def loadApplications(self, directory = None, override = False):
+        if not directory:
+            directory = self._applicationDirectory
+        if override:
+            self._applications.clear()
+        if os.path.exists(directory):
+            for f in os.listdir(directory):
+                fullFileName = os.path.join(directory, f)
+                if os.path.isfile(fullFileName) and f.endswith('.conf'):
+                    appName = f.rstrip('.conf')
+                    if appName in self._applications and not override:
+                        print("loadApplications: " + appName + " already exists, do nothing for configuration file: " + fullFileName)
+                    else:
+                        self._applications[appName] = {"tree": BoostInfoParser(), "dataPrefix": [], "version": int(time.time())}
+                        self._applications[appName]["tree"].read(fullFileName)
+                        data = Data(Name(self.prefix).append(appName).append("_schema").appendVersion(self._applications[appName]["version"]))
+                        data.setContent(str(self._applications[appName]["tree"].getRoot()))
+                        self.signData(data)
+                        self._memoryContentCache.add(data)
+                        try:
+                            validatorTree = self._applications[appName]["tree"]["validator"][0]
+                            for rule in validatorTree["rule"]:
+                                self._applications[appName]["dataPrefix"].append(rule["id"][0].value)
+                        # TODO: don't swallow any general exceptions, we want to catch only KeyError (make sure) here
+                        except Exception as e:
+                            print("loadApplications parse configuration file " + fullFileName + " : " + str(e))
+
+        return
 
 if __name__ == '__main__':
-    import sys
     import os
-    # todo - should I enforce the suffix 'gateway'?
+    import sys
+
     nArgs = len(sys.argv) - 1
-    if nArgs < 2:
+    if nArgs == 0:
         from pyndn.util.boost_info_parser import BoostInfoParser
-        fileName = '/usr/local/etc/ndn/iot_controller.conf'
-        if nArgs == 1:
-            fileName = sys.argv[1]
+        fileName = os.path.expanduser('~/.ndn/iot_controller.conf')
     
-        try:
-            config = BoostInfoParser()
-            config.read(fileName)
-        except IOError:
-            print('Could not read {}, exiting...'.format(fileName))
-            sys.exit(1)
-        else:
-            deviceName = config["device/controllerName"][0].value
-            networkName = config["device/environmentPrefix"][0].value
+        config = BoostInfoParser()
+        config.read(fileName)
+        deviceName = config["device/controllerName"][0].value
+        networkName = config["device/environmentPrefix"][0].value
     elif nArgs == 2:
         networkName = sys.argv[1]
         deviceName = sys.argv[2]
@@ -398,30 +614,7 @@ if __name__ == '__main__':
         print('Usage: {} [network-name controller-name]'.format(sys.argv[0]))
         sys.exit(1)
 
-    try:
-        
-        tempFile = '/tmp/ndn-iot/iot.conf'
-        tempDir = os.path.dirname(tempFile)
-
-        if os.path.exists(tempFile):
-            print ('Another gateway instance may be running. If not, delete {} and try again'.format(tempFile))
-            sys.exit(1)
-        else:
-            try:
-                os.makedirs(tempDir)
-            except OSError:
-                pass # errors happen when the directory exists :/
-            # save configuration in a place where the console can read it
-            with open(tempFile, 'w') as nameFile:
-                nameFile.write('{}\t{}\n'.format(networkName, deviceName))
-    except IOError as e:
-        print('Could not write configuration: error')
-        sys.exit(1)
-
     deviceSuffix = Name(deviceName)
     networkPrefix = Name(networkName)
     n = IotController(deviceSuffix, networkPrefix)
-    try:
-        n.start()
-    finally:
-        os.remove(tempFile) 
+    n.start()
