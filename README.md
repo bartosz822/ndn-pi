@@ -1,20 +1,13 @@
 Named Data Network Internet of Things Toolkit (NDN-IoTT)
 ==========================
 
- ***
- Update: Due to a lot of recent interest in this toolkit, there is now [a form here](https://goo.gl/forms/WDTG0Xtx2OT4KL0h1) for anyone who is running into difficulties installing or using ndn-pi. Based on the responses, we may update the project.
- 
- While you wait for an update, some users have reported success using current versions of PyNDN2 and copying parts of the [updated ndn-pi framework](https://github.com/remap/ndn-flow/tree/master/framework/ndn_pi) used in the Flow application.
- 
- ***
- 
  Getting Started
 ---------------------------------
 
 The major components of this kit are:
 -	PyNDN: a Python implementation of NDN
 -	nfd: the NDN Forwarding Daemon, which manages connections (faces)
--   nrd: the NDN Routing Daemon, which routes interests and data 
+-   nrd: the NDN Routing Daemon, which routes interests and data
 
 There are other libraries included for further exploration of NDN:
 -   repo-ng: a data repository server
@@ -25,21 +18,26 @@ There are other libraries included for further exploration of NDN:
 
 In order to communicate using NDN, all devices, Raspberry Pi or otherwise, must be
 connected to the same LAN. By default, Raspberry Pis are configured to create or join
-a WiFi network named 'Raspi\_NDN' if a wireless interface is available. 
+a WiFi network named 'Raspi\_NDN' if a wireless interface is available.
 
 The default password for 'Raspi\_NDN' is 'defaultpasswd'. It can be changed with the ndn-wifi-passwd tool,
 or by modifying /etc/hostapd/hostapd.conf and /etc/wpa_supplicant/wpa_supplicant.conf.
 
-Alternatively, you may connect your Raspberry Pis by Ethernet.    
+Alternatively, you may connect your Raspberry Pis by Ethernet.
+
+### Installing nfd
+
+This toolkit works only if you have `nfd` installed on your Raspberry. There are however no binary releases of `nfd` for pi as it is not officially supported platform. In order to install it you need firstly `ndn-cxx` library for which installation instruction you can find here https://named-data.net/doc/ndn-cxx/current/INSTALL.html.
+You will have to compile it from source either on PI or crosscompile it on PC and copy to PI. I've sucessfully compiled it on Raspberry PI 3, however you need to extend (1GB should work) swap file as 1GB of memory is not enough and segfaults occur during compilation. The next step is to install nfd itself for which instruction could be found here https://named-data.net/doc/NFD/current/INSTALL.html.
 
 ### Network Configuration
 
-If you are using multiple Raspberry Pis, they must all be connected to the same network, whether by WiFi 
+If you are using multiple Raspberry Pis, they must all be connected to the same network, whether by WiFi
 or Ethernet. This allows interests and data to be multicast to the other nodes over UDP. To set up multicast,
 you must register your network an NDN multicast face.
 
-There is an installed script, ndn-iot-start, that will start the NDN forwarder and router if they are not 
-already running, and automatically route traffic from your nodes to the multicast face. It assumes that your 
+There is an installed script, ndn-iot-start, that will start the NDN forwarder and router if they are not
+already running, and automatically route traffic from your nodes to the multicast face. It assumes that your
 Pis are connected to a WiFi network, using the 'wlan0' interface. If you are using a different interface, e.g.
 'eth0' for ethernet, you may run
 
@@ -55,12 +53,12 @@ If you wish to configure routing yourself **(not recommended)**, see [below](#ma
 The basic unit of the IoT toolkit network is a node. Nodes are virtual, in that one
 machine may host multiple simple nodes instead of one multi-purpose node. Although the functions of a node are
 completely up to the user, we recommend using each node to group related commands. For example, a Raspberry Pi
-with both LEDs and infrared sensors may run one node that responds to LED control commands, and another that 
+with both LEDs and infrared sensors may run one node that responds to LED control commands, and another that
 reports proximity readings from the IR sensors.    
 
-There is one special node type, the controller. Each network must have a controller. Its primary responsibilities 
-are creating network certificates for all other nodes in the network, and maintaining a list of available 
-services. 
+There is one special node type, the controller. Each network must have a controller. Its primary responsibilities
+are creating network certificates for all other nodes in the network, and maintaining a list of available
+services.
 
 The configuration for the controller consists of just the network name (default is '/home') and the controller name
 (default is 'controller'). The default configuration file can be in /home/pi/.ndn/controller.conf. To change controller settings, you
@@ -70,7 +68,7 @@ may edit this file, or run the included ndn-iot-controller script:
 
 When nodes other than the controller join the network, they must be added by the user, by providing a serial number and
 PIN. This prevents unknown machines from gaining access to protected network commands. Use the menu provided by the controller to pair the new
-node by entering 'P'. You will be prompted for the serial, PIN and a new name for your node. After a few seconds, the node will 
+node by entering 'P'. You will be prompted for the serial, PIN and a new name for your node. After a few seconds, the node will
 finish its setup handshake with the controller and be ready to interact with the other nodes. You can use 'D' for 'directory' to
 see the commands available on the new node.
 
@@ -85,7 +83,7 @@ versions.
 This toolkit contains three examples that demonstrate common node and network setups.
 -	led\_control:	Control LEDs connected to the general purpose input/output (GPIO) pins over the network
 -	hdmi\_cec: 	Turn a CEC-enabled device on or off depending on room occupancy
--	content\_store: Save device statistics in a MemoryContentCache object for later analysis or logging 
+-	content\_store: Save device statistics in a MemoryContentCache object for later analysis or logging
 
 Try running these examples and going through the tutorial [TUTORIAL.md](TUTORIAL.md) to learn how nodes work together.
 
@@ -99,11 +97,11 @@ steps.
 1. Ensure that the Raspberry Pi is connected to the network (wired or wireless) that will host your IoT network.
 
 2. Start the NDN forwarder and router by running
-        
+
         nfd-start
 
 3. Tell the forwarder to route network traffic to the multicast face.
- If you are using WiFi only with your Raspberry Pi, the multicast face will typically have faceid 2. Otherwise, 
+ If you are using WiFi only with your Raspberry Pi, the multicast face will typically have faceid 2. Otherwise,
  you will need to use the 'nfd-status' command to determine the correct face to register. Run
 
         nfd-status -f
@@ -124,10 +122,10 @@ Writing IoT Nodes
 
 
 ### Provided Classes
-There are several classes provided as part of the Internet of Things toolkit for NDN. 
+There are several classes provided as part of the Internet of Things toolkit for NDN.
 #### IotNode
 
-Nodes in your network will generally be subclasses of IotNode. 
+Nodes in your network will generally be subclasses of IotNode.
 
 The most important method for customizing nodes is `addCommand`:
 
@@ -162,7 +160,7 @@ The most important method for customizing nodes is `addCommand`:
 Besides adding methods for interest handling with `addCommand`, nodes can be further customized by overriding the
 following methods:
 
-* setupComplete 
+* setupComplete
 ```python
     def setupComplete(self)
 ```
@@ -170,7 +168,7 @@ following methods:
 certificate from the controller and sent its capabilities list. This is the recommended
 place for customized node behavior, e.g. searching for other nodes, scheduling tasks,
 setting up custom callbacks.
-  
+
 * unknownCommandResponse
 ```python
     #returns pyndn.Data or None
@@ -184,7 +182,7 @@ your own specialized handling of the interest and return a Data packet.
 ```python
     def verificationFailed(self, dataOrInterest)
 ```
-   Called when a command interest fails verification. The most common reasons for failing verification are invalid signatures, 
+   Called when a command interest fails verification. The most common reasons for failing verification are invalid signatures,
 and unsigned interests being sent when signed interests are expected. The default implementation logs the failure.
 
 * getSerial
@@ -197,7 +195,7 @@ Raspberry Pis or even individual IotNodes.
 ------
 
 The remaining classes do not need to be subclassed, and it is not recommended that you modify them
- before you are comfortable with the toolkit and with  NDN security management. For more information, 
+ before you are comfortable with the toolkit and with  NDN security management. For more information,
 see [NDN Resources](#ndn-resources).
 
 #### IoT Network Classes
@@ -219,4 +217,3 @@ NDN Resources
 * [NDN Common Client Libraries](http://named-data.net/doc/ndn-ccl-api/) for documentation of the classes available in PyNDN
 * [ndn-cxx wiki](http://redmine.named-data.net/projects/ndn-cxx/wiki) for security information
 * [NFD wiki](http://redmine.named-data.net/projects/nfd/wiki) for more on the internals of NDN packets and forwarding
-

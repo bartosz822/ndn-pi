@@ -3,7 +3,7 @@
 #
 # Copyright (C) 2014 Regents of the University of California.
 # Author: Adeola Bannis <thecodemaiden@gmail.com>
-# 
+#
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Lesser General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
@@ -31,12 +31,10 @@ class LedNode(IotNode):
         self.pinNumber = pinNumber
         GPIO.setmode(GPIO.BCM)
         GPIO.setup(pinNumber, GPIO.OUT)
-    
+
         onCommand = Name('setLight').append('on')
         offCommand = Name('setLight').append('off')
         self.addCommand(onCommand, self.onLightCommand, ['led', 'light'],
-            False)
-        self.addCommand(offCommand, self.onLightCommand, ['led', 'light'],
             False)
 
         self.blinkPWM = None
@@ -48,10 +46,8 @@ class LedNode(IotNode):
             commandTypeComponent = interest.getName().get(self.prefix.size()+1)
             commandType = commandTypeComponent.toEscapedString()
             if commandType == 'on':
-                print("elo")
                 GPIO.output(self.pinNumber, GPIO.HIGH)
             elif commandType == 'off':
-                print("melo")
                 GPIO.output(self.pinNumber, GPIO.LOW)
             else:
                 raise RuntimeError('BadCommand')
@@ -78,6 +74,6 @@ if __name__ == '__main__':
     try:
 	    pinNumber = int(sys.argv[1])
     except IndexError, ValueError:
-        pinNumber = 24
+        pinNumber = 17
     node = LedNode(pinNumber)
     node.start()
